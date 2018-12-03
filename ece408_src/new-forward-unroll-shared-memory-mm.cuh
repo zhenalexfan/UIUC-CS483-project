@@ -9,8 +9,69 @@ namespace mxnet
   namespace op
   {
 
-#define TILE_WIDTH 16
-#define MASK_SIZE 7
+#define TILE_WIDTH 32
+#define CUDA_MAX_NUM_THREADS 1024
+
+    __global__ void unroll_kernel(int b, int C, int H, int W, int K, float* x, float* X_unroll){
+  #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+      int t = blockIdx.x * CUDA_MAX_NUM_THREADS + threadIdx.x;
+      int H_out = H - K + 1;
+      int W_out = W - K + 1;
+      int W_unroll = H_out * W_out;
+
+      if(t < C * W_unroll) {
+        int c = t / W_unroll;
+        int s = t % W_unroll;
+        int h_out = s / W_out;
+        int w_out = s % W_out;
+        int h_unroll = h_out * W_out + w_out;
+        int w_base = c*K*K;
+        for(int p = 0; p < K; p++) {
+          for(int q = 0; q < K; q++) {
+            int w_unroll = w_base + p*K + q;
+            X_unroll[w_unroll * W_unroll + h_unroll] = x4d(b, c, h_out+p, w_out+q);
+          }
+        }
+      }
+
+    }
+
+
+    __global__ void matrixMultiplyShared(float *A, float *B, float *C, int numARows, int numAColumns, int numBRows, int numBColumns, int numCRows, int numCColumns){
+      int bx = blockIdx.x; int by = blockIdx.y;
+      int tx = threadIdx.x; int ty = threadIdx.y;
+
+      int Row = by*TILE_WIDTH + ty;
+      int Col = bx*TILE_WIDTH + tx;
+
+      __shared__ float M[TILE_WIDTH][TILE_WIDTH];
+      __shared__ float N[TILE_WIDTH][TILE_WIDTH];
+
+      float Cval = 0;
+
+      for(int i = 0; i < ceil(numAColumns/(float)TILE_WIDTH); ++i) {
+        if((Row < numARows) && (i*TILE_WIDTH+tx < numAColumns))
+          M[ty][tx] = A[Row*numAColumns + i*TILE_WIDTH + tx];
+        else
+          M[ty][tx] = 0;
+
+        if((Col < numBColumns) && (i*TILE_WIDTH+ty < numBRows))
+          N[ty][tx] = B[(i*TILE_WIDTH + ty)*numBColumns+Col];
+        else
+          N[ty][tx]=0;
+
+        __syncthreads();
+
+        for(int j = 0; j < TILE_WIDTH; ++j) {
+          Cval += M[ty][j] * N[j][tx];
+        }
+        __syncthreads();
+      }
+
+      if(Row < numCRows && Col < numCColumns)
+        C[Row*numCColumns + Col] = Cval;
+    }
+
 
     __global__ void forward_kernel(float *y, const float *x, const float *k, const int B, const int M, const int C, const int H, const int W, const int K)
     {
@@ -28,12 +89,12 @@ namespace mxnet
       (void)W_out; // silence declared but never referenced warning. remove this line when you start working
       const int W_grid = ceil(W_out / (TILE_WIDTH * 1.0));
 
-// An example use of these macros:
-// float a = y4d(0,0,0,0)
-// y4d(0,0,0,0) = a
-#define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
-#define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
-#define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
+      // An example use of these macros:
+      // float a = y4d(0,0,0,0)
+      // y4d(0,0,0,0) = a
+  #define y4d(i3, i2, i1, i0) y[(i3) * (M * H_out * W_out) + (i2) * (H_out * W_out) + (i1) * (W_out) + i0]
+  #define x4d(i3, i2, i1, i0) x[(i3) * (C * H * W) + (i2) * (H * W) + (i1) * (W) + i0]
+  #define k4d(i3, i2, i1, i0) k[(i3) * (C * K * K) + (i2) * (K * K) + (i1) * (K) + i0]
 
       int n, m, h, w, c, p, q;
       n = blockIdx.x;
@@ -41,31 +102,13 @@ namespace mxnet
       h = blockIdx.z / W_grid * TILE_WIDTH + threadIdx.y;
       w = blockIdx.z % W_grid * TILE_WIDTH + threadIdx.x;
 
-      __shared__ float x_s[12* (TILE_WIDTH + MASK_SIZE) * (TILE_WIDTH + MASK_SIZE)];
-
-#define xs3d(i2, i1, i0) x_s[(i2)*((TILE_WIDTH + MASK_SIZE) * (TILE_WIDTH + MASK_SIZE)) + (i1) * (TILE_WIDTH + MASK_SIZE) + i0]
-      for (c = 0; c < C; c++) {
-        xs3d(c, threadIdx.y, threadIdx.x) = x4d(n, c, h, w);
-        if (threadIdx.y < MASK_SIZE) {
-          xs3d(c, TILE_WIDTH + threadIdx.y, threadIdx.x) = x4d(n, c, TILE_WIDTH + h, w);
-        }
-        if (threadIdx.x < MASK_SIZE) {
-          xs3d(c, threadIdx.y, TILE_WIDTH + threadIdx.x) = x4d(n, c, h, TILE_WIDTH + w);
-        }
-        if (threadIdx.y < MASK_SIZE && threadIdx.x < MASK_SIZE) {
-          xs3d(c, TILE_WIDTH + threadIdx.y, TILE_WIDTH + threadIdx.x) = x4d(n, c, TILE_WIDTH + h, TILE_WIDTH + w);
-        }
-      }
-
-      __syncthreads();
-
       if (n < B && m < M && h < H_out && w < W_out) {
+
         float acc = 0;
         for (c = 0; c < C; c++) {
           for (p = 0; p < K; p++) {
             for (q = 0; q < K; q++) {
-              // acc += x4d(n, c, h + p, w + q) * k4d(m, c, p, q);
-              acc += xs3d(c, threadIdx.y + p, threadIdx.x + q) * k4d(m, c, p, q);
+              acc += x4d(n, c, h + p, w + q) * k4d(m, c, p, q);
             }
           }
         }
@@ -110,15 +153,32 @@ namespace mxnet
       // Set the kernel dimensions
       const int H_out = H - K + 1;
       const int W_out = W - K + 1;
+      int W_unroll = H_out * W_out;
+      int H_unroll = C * K * K;
       const int H_grid = ceil(H_out / (TILE_WIDTH * 1.0));
       const int W_grid = ceil(W_out / (TILE_WIDTH * 1.0));
       const int Z = H_grid * W_grid;
       dim3 gridDim(B, M, Z);
       dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
 
-      // Call the kernel
-      forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
+      float* X_unrolled;
+      cudaMalloc((void **) &X_unrolled, H_unroll * W_unroll * sizeof(float));
 
+      for(int n = 0; n < B; n++) {
+        unroll_kernel<<<ceil((float)(C*H_out*W_out/CUDA_MAX_NUM_THREADS)),
+												CUDA_MAX_NUM_THREADS>>>(
+													n, C, H, W, K, x.dptr_, X_unrolled);
+        cudaDeviceSynchronize();
+        matrixMultiplyShared<<<dim3(ceil((float)W_unroll/TILE_WIDTH), ceil((float)M/TILE_WIDTH), 1),
+																dim3(TILE_WIDTH, TILE_WIDTH, 1)>>>(
+																	w.dptr_, X_unrolled, &y.dptr_[n*M*H_out*W_out], M,
+																	H_unroll, H_unroll, W_unroll, M, W_unroll);
+        cudaDeviceSynchronize();
+      }
+
+
+      // Call the kernel
+      //forward_kernel<<<gridDim, blockDim>>>(y.dptr_,x.dptr_,w.dptr_, B,M,C,H,W,K);
       // Use MSHADOW_CUDA_CALL to check for CUDA runtime errors.
       MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
     }
